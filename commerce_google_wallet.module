@@ -1,0 +1,313 @@
+<?php
+
+function _commerce_google_wallet_settings() {
+  return array(
+    'seller_identifier' => drupal_variable_get('google_wallet_seller_identifier', ''),
+    'seller_secret' => drupal_variable_get('google_wallet_seller_secret', ''),
+    'sandbox_mode' => drupal_variable_get('google_wallet_sandbox_mode', 1),
+  );
+}
+
+/*
+ *  Attach some field instances to a product bundle so they can support
+ *  recurring payments
+ */
+function _commerce_google_wallet_create_product_field_instances($bundle) {
+  commerce_price_create_instance('google_wallet_recurring_price', 'commerce_product', $bundle, t('Recurring Price'), 1, 'calculated_sell_price');
+}
+
+/*
+ *  Remove all fields attatched to a product bundle by this module
+ */
+function _commerce_google_wallet_delete_product_field_instances($bundle) {
+  $instance = field_info_instance('commerce_product', 'google_wallet_recurring_price', $bundle);
+  field_delete_instance($instance);
+}
+
+/*
+ *  Attach some field instances to a line item bundle so they can support
+ *  recurring payments
+ */
+function _commerce_google_wallet_create_line_item_field_instances($bundle) {
+  commerce_price_create_instance('google_wallet_recurring_payment', 'commerce_line_item', $bundle, t('Recurring Payment'), 0);
+  _commerce_google_wallet_create_active_subscription_field_instance('google_wallet_actv_subscription', 'commerce_line_item', $bundle, t('Active Subscription'), 1);
+}
+
+/*
+ *  Remove all fields attatched to a line item bundle by this module
+ */
+function _commerce_google_wallet_delete_line_item_field_instances($bundle) {
+  foreach(array('google_wallet_recurring_payment', 'google_wallet_actv_subscription') as $field_instance_name) {
+    $instance = field_info_instance('commerce_line_item', $field_instance_name, $bundle);
+    field_delete_instance($instance);
+  }
+}
+
+function _commerce_google_wallet_create_active_subscription_field_instance($field_name, $entity_type, $bundle, $label, $weight = 0, $display = array()) {
+  field_cache_clear();
+
+  $field = field_info_field($field_name);
+  $instance = field_info_instance($entity_type, $field_name, $bundle);
+
+  if (empty($field)) {
+    $field = array(
+      'field_name' => $field_name,
+      'type' => 'number_integer',
+      'cardinality' => 1,
+      'translatable' => FALSE,
+      'locked' => TRUE,
+    );
+    $field = field_create_field($field);
+  }
+
+  if (empty($instance)) {
+    $instance = array(
+      'field_name' => $field_name,
+      'entity_type' => $entity_type,
+      'bundle' => $bundle,
+
+      'label' => $label,
+      'settings' => array(
+        'min' => 0,
+        'max' => 1,
+      ),
+
+      'widget' => array(
+        'type' => 'options_onoff',
+        'weight' => $weight,
+        'settings' => array(),
+      ),
+
+      'display' => array(),
+    );
+
+    $entity_info = entity_get_info($entity_type);
+
+    // Spoof the default view mode and node teaser so its display type is set.
+    $entity_info['view modes'] += array(
+      'default' => array(),
+      'node_teaser' => array(),
+    );
+
+    foreach ($entity_info['view modes'] as $view_mode => $data) {
+      $instance['display'][$view_mode] = $display;
+    }
+
+    field_create_instance($instance);
+  }
+}
+
+function _commerce_google_wallet_order_jwt($order) {
+  include_once 'libs/JWT.php';
+
+  $settings = _commerce_google_wallet_settings();
+
+  $order_wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $order_total = $order_wrapper->commerce_order_total->value();
+
+  // Save the order id so we know which commerce order to refer to when we
+  // receive postbacks from Google
+  $order_jwt_content_seller_data = array(
+    'order_id' => $order->order_id,
+  );
+
+  // Iterate through each of the line items looking for subscription activated
+  // line item types, adding up the total of the recurring payment.
+  
+  // An rmpty commerce_price array for adding up the subscription prices
+  $subscription_commerce_price_total = array(
+    'price' => 0,
+    'currency_code' => $order_wrapper->commerce_order_total->currency_code->value(),
+    'data' => array(
+      'components' => array(),
+    ),
+  );
+  foreach($order_wrapper->commerce_line_items as $line_item_wrapper) {
+    $bundle = $line_item_wrapper->type->value();
+    if(variable_get('google_wallet_line_item_type_'.$bundle.'_subscription', 0)) {
+      $subscription_commerce_price_total['data']['components'][] = array(
+        'price' => $line_item_wrapper->google_wallet_recurring_payment->value(),
+      );
+    }
+  }
+  $subscription_commerce_price_total = commerce_price_component_total($subscription_commerce_price_total);
+  $subscription_total = commerce_currency_amount_to_decimal($subscription_commerce_price_total['amount'], $subscription_commerce_price_total['currency_code']);
+
+  // Build the JWT content based on whether we have a subscription component to
+  // the order or not
+  if($subscription_total > 0) {
+    $order_jwt_content = array(
+      'iss' => $settings['seller_identifier'],
+      'aud' => 'Google',
+      'typ' => 'google/payments/inapp/subscription/v1',
+      'exp' => time() + 3600,
+      'iat' => time(),
+      'request' => array(
+        'name' => 'Your Baked Sites Order',
+        'description' => 'Your site baked to perfection. Gooey, moist and delicious.',
+        'sellerData' => drupal_json_encode($order_jwt_content_seller_data),
+        'initialPayment' => array(
+          'price' => commerce_currency_amount_to_decimal($order_total['amount'], $order_total['currency_code']),
+          'currencyCode' => $order_total['currency_code'],
+          'paymentType' => 'prorated',
+        ),
+        'recurrence' => array(
+          'price' => commerce_currency_amount_to_decimal($subscription_commerce_price_total['amount'], $subscription_commerce_price_total['currency_code']),
+          'currencyCode' => $subscription_commerce_price_total['currency_code'],
+          'startTime' => strtotime('+1 month'),
+          'frequency' => 'monthly',
+        ),
+      ),
+    );
+  } else {
+    $order_jwt_content = array(
+      'iss' => $settings['seller_identifier'],
+      'aud' => 'Google',
+      'typ' => 'google/payments/inapp/item/v1',
+      'exp' => time() + 3600,
+      'iat' => time(),
+      'request' => array(
+        'name' => 'Your Baked Sites Order',
+        'description' => 'Your site baked to perfection. Gooey, moist and delicious.',
+        'sellerData' => drupal_json_encode($order_jwt_content_seller_data),
+        'price' => commerce_currency_amount_to_decimal($order_total['amount'], $order_total['currency_code']),
+        'currencyCode' => $order_total['currency_code'],
+      )
+    );
+  }
+
+  return JWT::encode($order_jwt_content, $settings['seller_secret']);
+}
+
+/*
+ *  Implements hook_menu()
+ */
+function commerce_google_wallet_menu() {
+  $items['google-wallet/postback'] = array(
+    'page callback' => 'commerce_google_wallet_postback',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'commerce_google_wallet.pages.inc'
+  );
+  return $items;
+}
+
+/*
+ *  Implements hook_commerce_payment_method_info()
+ */
+function commerce_google_wallet_commerce_payment_method_info() {
+  $payment_methods['google_wallet'] = array(
+    'method_id' => 'google_wallet',
+    'base' => 'commerce_google_wallet',
+    'title' => t('Google Wallet'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+  );
+  return $payment_methods;
+}
+
+/*
+ *  Implements commerce callback_redirect_form()
+ *  We use the redirect form to attach the Google Wallet payment method.
+ */
+function commerce_google_wallet_redirect_form($form, &$form_state, $order, $payment_method) {
+  $return = array();
+
+  $settings = _commerce_google_wallet_settings();
+
+  $order_jwt = _commerce_google_wallet_order_jwt($order);
+
+  // Attach the right Google Wallet for Digital Goods API .js file to the redirect form
+  if($settings['sandbox_mode']) {
+    $return['google_wallet']['#attached']['js'][] = 'https://sandbox.google.com/checkout/inapp/lib/buy.js';
+  } else {
+    $return['google_wallet']['#attached']['js'][] = 'https://wallet.google.com/inapp/lib/buy.js';
+  }
+
+  $success_url = url('checkout/'.$order->order_id.'/payment/return/'.$order->data['payment_redirect_key'], array('absolute' => true));
+  $failure_url = url('checkout/'.$order->order_id.'/payment/back/'.$order->data['payment_redirect_key'], array('absolute' => true));
+
+  drupal_add_js(
+    'google.payments.inapp.buy({"jwt":'.drupal_json_encode($order_jwt).', "success":function() { window.location = "'.$success_url.'" }, "failure":function() { window.location = "'.$failure_url.'" } });',
+    array('type' => 'inline', 'scope' => 'footer')
+  );
+
+  return $return;
+}
+
+/*
+ *  Implements hook_form_commerce_product_ui_product_type_form_alter()
+ *  Alter the product bundle form so we can add a checkbox that enables this
+ *  bundle as a Google Wallet subscription product
+ */
+function commerce_google_wallet_form_commerce_product_ui_product_type_form_alter(&$form, &$form_state) {
+  $bundle = $form_state['product_type']['type'];
+  $form['product_type']['google_wallet_subscription'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable this product type for <strong>Google Wallet</strong> payment subscriptions.'),
+    '#default_value' => variable_get('google_wallet_product_type_'.$bundle.'_subscription', 0),
+  );
+  $form['actions']['submit']['#submit'][] = '_commerce_google_wallet_form_commerce_product_ui_product_type_form_submit';
+}
+
+function _commerce_google_wallet_form_commerce_product_ui_product_type_form_submit($form, &$form_state) {
+  $bundle = $form_state['product_type']['type'];
+  if($form_state['values']['product_type']['google_wallet_subscription']) {
+    variable_set('google_wallet_product_type_'.$bundle.'_subscription', 1);
+    _commerce_google_wallet_create_product_field_instances($bundle);
+  } else {
+    variable_set('google_wallet_product_type_'.$bundle.'_subscription', 0);
+    _commerce_google_wallet_delete_product_field_instances($bundle);
+  }
+}
+
+/*
+ *  Implements hook_form_commerce_custom_product_line_item_type_form_alter()
+ *  Alter the line item bundle form so we can add a checkbox that enables this
+ *  bundle as a Google Wallet subscription product
+ */
+function commerce_google_wallet_form_commerce_custom_product_line_item_type_form_alter(&$form, &$form_state) {
+  $bundle = $form_state['line_item_type']['type'];
+  $form['line_item_type']['google_wallet_subscription'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Enable this product line item type for <strong>Google Wallet</strong> payment subscriptions.'),
+    '#default_value' => variable_get('google_wallet_line_item_type_'.$bundle.'_subscription', 0),
+  );
+  $form['#submit'][] = '_commerce_google_wallet_form_commerce_custom_product_line_item_type_form_submit';
+}
+
+function _commerce_google_wallet_form_commerce_custom_product_line_item_type_form_submit($form, &$form_state) {
+  $bundle = $form_state['line_item_type']['type'];
+  if($form_state['values']['line_item_type']['google_wallet_subscription']) {
+    variable_set('google_wallet_line_item_type_'.$bundle.'_subscription', 1);
+    _commerce_google_wallet_create_line_item_field_instances($bundle);
+  } else {
+    variable_set('google_wallet_line_item_type_'.$bundle.'_subscription', 0);
+    _commerce_google_wallet_delete_line_item_field_instances($bundle);
+  }
+}
+
+/*
+ *  Implements hook_form_commerce_cart_product_add()
+ *  Add a submit handler that will fill in the line item fields this module
+ *  provides for recurring payments, with their defaults and the corresponsing
+ *  fields in the product.
+ */
+function commerce_google_wallet_commerce_cart_product_add($order, $product, $quantity, $line_item) {
+  if(variable_get('google_wallet_line_item_type_'.$line_item->type.'_subscription', 0)
+      && variable_get('google_wallet_product_type_'.$product->type.'_subscription', 0)) {
+    $product_wrapper = entity_metadata_wrapper('commerce_product', $product);
+    $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+
+    // Calculate the recurring payment total and save into the corresponding
+    // line item fields
+    $recurring_total = $product_wrapper->google_wallet_recurring_price->raw();
+    $recurring_total['amount'] = $recurring_total['amount'] * $quantity;
+    $line_item_wrapper->google_wallet_recurring_payment->set($recurring_total);
+
+    // Set the subscription line item's state to active
+    $line_item_wrapper->google_wallet_actv_subscription->set(1);
+    commerce_line_item_save($line_item_wrapper->value());
+  }
+}
